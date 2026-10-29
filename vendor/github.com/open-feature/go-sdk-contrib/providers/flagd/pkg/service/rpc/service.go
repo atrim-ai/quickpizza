@@ -1,0 +1,740 @@
+package rpc
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	schemaConnectV2 "buf.build/gen/go/open-feature/flagd/connectrpc/go/flagd/evaluation/v2/evaluationv2connect"
+	schemaV2 "buf.build/gen/go/open-feature/flagd/protocolbuffers/go/flagd/evaluation/v2"
+	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
+	"github.com/go-logr/logr"
+	flagdModels "github.com/open-feature/flagd/core/pkg/model"
+	flagdService "github.com/open-feature/flagd/core/pkg/service"
+	"github.com/open-feature/go-sdk-contrib/providers/flagd/internal/cache"
+	"github.com/open-feature/go-sdk-contrib/providers/flagd/internal/logger"
+	of "github.com/open-feature/go-sdk/openfeature"
+	"golang.org/x/net/context"
+	"google.golang.org/protobuf/types/known/structpb"
+)
+
+const (
+	ReasonCached      = "CACHED"
+	ClientNotReadyMsg = "client did not yet finish the initialization"
+)
+
+var ErrClientNotReady = of.NewProviderNotReadyResolutionError(ClientNotReadyMsg)
+
+type Configuration struct {
+	Port            uint16
+	Host            string
+	CertificatePath string
+	SocketPath      string
+	TLSEnabled      bool
+	OtelInterceptor bool
+	DeadlineMs      int
+	Selector        string
+}
+
+// Service handles the client side  interface for the flagd server
+type Service struct {
+	cache        *cache.Service
+	cfg          Configuration
+	events       chan of.Event
+	logger       logr.Logger
+	retryCounter retryCounter
+	deadlineMs   int
+
+	client      schemaConnectV2.ServiceClient
+	cancelHook  context.CancelFunc
+	wg          sync.WaitGroup
+	streamReady chan error // Channel to signal when event stream is connected
+}
+
+func NewService(cfg Configuration, cache *cache.Service, logger logr.Logger, retries int) *Service {
+	logger.Info("operating in rpc mode with flags sourced from " + fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
+	return &Service{
+		cache:        cache,
+		cfg:          cfg,
+		events:       make(chan of.Event, 1),
+		logger:       logger,
+		retryCounter: newRetryCounter(retries),
+		streamReady:  make(chan error, 1),
+		deadlineMs:   cfg.DeadlineMs,
+	}
+}
+
+const ConnectionError = "connection not made"
+
+type resolutionRequestConstraints interface {
+	schemaV2.ResolveBooleanRequest | schemaV2.ResolveStringRequest | schemaV2.ResolveIntRequest |
+		schemaV2.ResolveFloatRequest | schemaV2.ResolveObjectRequest
+}
+
+type resolutionResponseConstraints interface {
+	schemaV2.ResolveBooleanResponse | schemaV2.ResolveStringResponse | schemaV2.ResolveIntResponse |
+		schemaV2.ResolveFloatResponse | schemaV2.ResolveObjectResponse
+}
+
+func (s *Service) Init() error {
+	var err error
+	s.client, err = newClient(s.cfg)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	s.cancelHook = cancelFunc
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.startEventStream(ctx)
+	}()
+
+	// Wait for event stream to be established before considering init complete
+	// This ensures isInitialised() only returns true when we can actually handle events
+	return <-s.streamReady
+}
+
+func (s *Service) Shutdown() {
+	if s.cancelHook != nil {
+		s.cancelHook()
+	}
+	s.wg.Wait()
+}
+
+// ResolveBoolean handles the flag evaluation response from the flagd ResolveBoolean rpc
+func (s *Service) ResolveBoolean(ctx context.Context, key string, defaultValue bool,
+	evalCtx map[string]interface{}) of.BoolResolutionDetail {
+
+	if s.cache.IsEnabled() {
+		fromCache, ok := s.cache.GetCache().Get(key)
+		if ok {
+			fromCacheResDetail, ok := fromCache.(of.BoolResolutionDetail)
+			if ok {
+				fromCacheResDetail.Reason = ReasonCached
+				return fromCacheResDetail
+			}
+		}
+	}
+
+	if !s.isInitialised() {
+		return of.BoolResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: ErrClientNotReady,
+			},
+		}
+	}
+
+	var e of.ResolutionError
+	resp, err := resolve[schemaV2.ResolveBooleanRequest, schemaV2.ResolveBooleanResponse](
+		ctx, s.logger, s.deadlineMs, s.client.ResolveBoolean, key, evalCtx,
+	)
+	if err != nil {
+		if !errors.As(err, &e) {
+			e = of.NewGeneralResolutionError(err.Error())
+		}
+
+		return of.BoolResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: e,
+				Reason:          of.ErrorReason,
+			},
+		}
+	}
+
+	value := defaultValue
+	variant := derefString(resp.Variant)
+	reason := of.Reason(resp.Reason)
+	if !isDefaultOrDisabledFallback(variant, reason) && resp.Value != nil {
+		value = *resp.Value
+	}
+
+	detail := of.BoolResolutionDetail{
+		Value: value,
+		ProviderResolutionDetail: of.ProviderResolutionDetail{
+			ResolutionError: e,
+			Reason:          reason,
+			Variant:         variant,
+			FlagMetadata:    resp.Metadata.AsMap(),
+		},
+	}
+
+	if s.cache.IsEnabled() && detail.Reason == flagdModels.StaticReason {
+		s.cache.GetCache().Add(key, detail)
+	}
+
+	return detail
+}
+
+// ResolveString handles the flag evaluation response from the  flagd interface ResolveString rpc
+func (s *Service) ResolveString(ctx context.Context, key string, defaultValue string,
+	evalCtx map[string]interface{}) of.StringResolutionDetail {
+
+	if s.cache.IsEnabled() {
+		fromCache, ok := s.cache.GetCache().Get(key)
+		if ok {
+			fromCacheResDetail, ok := fromCache.(of.StringResolutionDetail)
+			if ok {
+				fromCacheResDetail.Reason = ReasonCached
+				return fromCacheResDetail
+			}
+		}
+	}
+
+	if !s.isInitialised() {
+		return of.StringResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: ErrClientNotReady,
+			},
+		}
+	}
+
+	var e of.ResolutionError
+	resp, err := resolve[schemaV2.ResolveStringRequest, schemaV2.ResolveStringResponse](
+		ctx, s.logger, s.deadlineMs, s.client.ResolveString, key, evalCtx,
+	)
+	if err != nil {
+		if !errors.As(err, &e) {
+			e = of.NewGeneralResolutionError(err.Error())
+		}
+
+		return of.StringResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: e,
+				Reason:          of.ErrorReason,
+			},
+		}
+	}
+
+	value := defaultValue
+	variant := derefString(resp.Variant)
+	reason := of.Reason(resp.Reason)
+	if !isDefaultOrDisabledFallback(variant, reason) && resp.Value != nil {
+		value = *resp.Value
+	}
+
+	detail := of.StringResolutionDetail{
+		Value: value,
+		ProviderResolutionDetail: of.ProviderResolutionDetail{
+			ResolutionError: e,
+			Reason:          reason,
+			Variant:         variant,
+			FlagMetadata:    resp.Metadata.AsMap(),
+		},
+	}
+
+	if s.cache.IsEnabled() && detail.Reason == flagdModels.StaticReason {
+		s.cache.GetCache().Add(key, detail)
+	}
+
+	return detail
+}
+
+// ResolveFloat handles the flag evaluation response from the  flagd interface ResolveFloat rpc
+func (s *Service) ResolveFloat(ctx context.Context, key string, defaultValue float64,
+	evalCtx map[string]interface{}) of.FloatResolutionDetail {
+
+	if s.cache.IsEnabled() {
+		fromCache, ok := s.cache.GetCache().Get(key)
+		if ok {
+			fromCacheResDetail, ok := fromCache.(of.FloatResolutionDetail)
+			if ok {
+				fromCacheResDetail.Reason = ReasonCached
+				return fromCacheResDetail
+			}
+		}
+	}
+
+	if !s.isInitialised() {
+		return of.FloatResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: ErrClientNotReady,
+			},
+		}
+	}
+
+	var e of.ResolutionError
+	resp, err := resolve[schemaV2.ResolveFloatRequest, schemaV2.ResolveFloatResponse](
+		ctx, s.logger, s.deadlineMs, s.client.ResolveFloat, key, evalCtx,
+	)
+	if err != nil {
+		if !errors.As(err, &e) {
+			e = of.NewGeneralResolutionError(err.Error())
+		}
+
+		return of.FloatResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: e,
+				Reason:          of.ErrorReason,
+			},
+		}
+	}
+
+	value := defaultValue
+	variant := derefString(resp.Variant)
+	reason := of.Reason(resp.Reason)
+	if !isDefaultOrDisabledFallback(variant, reason) && resp.Value != nil {
+		value = *resp.Value
+	}
+
+	detail := of.FloatResolutionDetail{
+		Value: value,
+		ProviderResolutionDetail: of.ProviderResolutionDetail{
+			ResolutionError: e,
+			Reason:          reason,
+			Variant:         variant,
+			FlagMetadata:    resp.Metadata.AsMap(),
+		},
+	}
+
+	if s.cache.IsEnabled() && detail.Reason == flagdModels.StaticReason {
+		s.cache.GetCache().Add(key, detail)
+	}
+
+	return detail
+}
+
+// ResolveInt handles the flag evaluation response from the  flagd interface ResolveNumber rpc
+func (s *Service) ResolveInt(ctx context.Context, key string, defaultValue int64,
+	evalCtx map[string]interface{}) of.IntResolutionDetail {
+
+	if s.cache.IsEnabled() {
+		fromCache, ok := s.cache.GetCache().Get(key)
+		if ok {
+			fromCacheResDetail, ok := fromCache.(of.IntResolutionDetail)
+			if ok {
+				fromCacheResDetail.Reason = ReasonCached
+				return fromCacheResDetail
+			}
+		}
+	}
+
+	if !s.isInitialised() {
+		return of.IntResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: ErrClientNotReady,
+			},
+		}
+	}
+
+	var e of.ResolutionError
+	resp, err := resolve[schemaV2.ResolveIntRequest, schemaV2.ResolveIntResponse](
+		ctx, s.logger, s.deadlineMs, s.client.ResolveInt, key, evalCtx,
+	)
+	if err != nil {
+		if !errors.As(err, &e) {
+			e = of.NewGeneralResolutionError(err.Error())
+		}
+
+		return of.IntResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: e,
+				Reason:          of.ErrorReason,
+			},
+		}
+	}
+
+	value := defaultValue
+	variant := derefString(resp.Variant)
+	reason := of.Reason(resp.Reason)
+	if !isDefaultOrDisabledFallback(variant, reason) && resp.Value != nil {
+		value = *resp.Value
+	}
+
+	detail := of.IntResolutionDetail{
+		Value: value,
+		ProviderResolutionDetail: of.ProviderResolutionDetail{
+			ResolutionError: e,
+			Reason:          reason,
+			Variant:         variant,
+			FlagMetadata:    resp.Metadata.AsMap(),
+		},
+	}
+
+	if s.cache.IsEnabled() && detail.Reason == flagdModels.StaticReason {
+		s.cache.GetCache().Add(key, detail)
+	}
+
+	return detail
+}
+
+// ResolveObject handles the flag evaluation response from the  flagd interface ResolveObject rpc
+func (s *Service) ResolveObject(ctx context.Context, key string, defaultValue interface{},
+	evalCtx map[string]interface{}) of.InterfaceResolutionDetail {
+	if s.cache.IsEnabled() {
+		fromCache, ok := s.cache.GetCache().Get(key)
+		if ok {
+			fromCacheResDetail, ok := fromCache.(of.InterfaceResolutionDetail)
+			if ok {
+				fromCacheResDetail.Reason = ReasonCached
+				return fromCacheResDetail
+			}
+		}
+	}
+
+	if !s.isInitialised() {
+		return of.InterfaceResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: ErrClientNotReady,
+			},
+		}
+	}
+
+	var e of.ResolutionError
+	resp, err := resolve[schemaV2.ResolveObjectRequest, schemaV2.ResolveObjectResponse](
+		ctx, s.logger, s.deadlineMs, s.client.ResolveObject, key, evalCtx,
+	)
+	if err != nil {
+		if !errors.As(err, &e) {
+			e = of.NewGeneralResolutionError(err.Error())
+		}
+
+		return of.InterfaceResolutionDetail{
+			Value: defaultValue,
+			ProviderResolutionDetail: of.ProviderResolutionDetail{
+				ResolutionError: e,
+				Reason:          of.ErrorReason,
+			},
+		}
+	}
+
+	var value = defaultValue
+	variant := derefString(resp.Variant)
+	reason := of.Reason(resp.Reason)
+	if !isDefaultOrDisabledFallback(variant, reason) && resp.Value != nil {
+		value = resp.Value.AsMap()
+	}
+
+	detail := of.InterfaceResolutionDetail{
+		Value: value,
+		ProviderResolutionDetail: of.ProviderResolutionDetail{
+			ResolutionError: e,
+			Reason:          reason,
+			Variant:         variant,
+			FlagMetadata:    resp.Metadata.AsMap(),
+		},
+	}
+
+	if s.cache.IsEnabled() && detail.Reason == flagdModels.StaticReason {
+		s.cache.GetCache().Add(key, detail)
+	}
+
+	return detail
+}
+
+func (s *Service) isInitialised() bool {
+	return s.client != nil
+}
+
+// isDefaultOrDisabledFallback reports whether the response represents an
+// unresolved evaluation (DEFAULT or DISABLED reason with an empty variant).
+// In that case the caller-supplied default value should be returned, matching
+// the behavior of the in-process resolver and other flagd providers.
+func isDefaultOrDisabledFallback(variant string, reason of.Reason) bool {
+	if variant != "" {
+		return false
+	}
+	r := string(reason)
+	return r == flagdModels.DefaultReason || r == flagdModels.DisabledReason
+}
+
+func resolve[req resolutionRequestConstraints, resp resolutionResponseConstraints](
+	ctx context.Context, logger logr.Logger, deadlineMs int,
+	resolver func(context.Context, *connect.Request[req]) (*connect.Response[resp], error),
+	flagKey string, evalCtx map[string]interface{},
+) (*resp, error) {
+	// Apply deadline to unary call if specified
+	if deadlineMs > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(deadlineMs)*time.Millisecond)
+		defer cancel()
+	}
+
+	evalCtxF, err := structpb.NewStruct(evalCtx)
+	if err != nil {
+		logger.Error(err, "struct from evaluation context")
+		return nil, of.NewParseErrorResolutionError(err.Error())
+	}
+
+	res, err := resolver(ctx, connect.NewRequest(&req{
+		FlagKey: flagKey,
+		Context: evalCtxF,
+	}))
+	if err != nil {
+		return nil, handleError(err)
+	}
+
+	return res.Msg, nil
+}
+
+func handleError(err error) of.ResolutionError {
+	connectErr := &connect.Error{}
+	errors.As(err, &connectErr)
+	switch connectErr.Code() {
+	case connect.CodeUnavailable:
+		return of.NewProviderNotReadyResolutionError(ConnectionError)
+	case connect.CodeNotFound:
+		return of.NewFlagNotFoundResolutionError(err.Error())
+	case connect.CodeInvalidArgument:
+		return of.NewTypeMismatchResolutionError(err.Error())
+	case connect.CodeDataLoss:
+		return of.NewParseErrorResolutionError(err.Error())
+	}
+	return of.NewGeneralResolutionError(err.Error())
+}
+
+func (s *Service) EventChannel() <-chan of.Event {
+	return s.events
+}
+
+// startEventStream - starts listening to flagd event stream with retries.
+// This contains blocking calls and busy wait backed retry attempts, hence must be called concurrently.
+// If retrying is exhausted, an event with openfeature.ProviderError will be emitted.
+func (s *Service) startEventStream(ctx context.Context) {
+	streamReadySignaled := false
+
+	// wraps connection with retry attempts
+	for s.retryCounter.retry() {
+		s.logger.V(logger.Debug).Info("connecting to event stream")
+		err := s.streamClient(ctx, &streamReadySignaled)
+		if err != nil {
+			// first check for ctx close and exit retrying as this is a shutdown
+			if errors.Is(ctx.Err(), context.Canceled) {
+				s.logger.V(logger.Debug).Info("context cancelled, exiting")
+				// Signal error if we haven't signaled success yet
+				if !streamReadySignaled {
+					s.signalStreamReady(ctx.Err())
+				}
+				return
+			}
+
+			// error in stream handler, purge cache if available and retry
+			s.logger.V(logger.Warn).Info(fmt.Sprintf("connection to event stream failed (%q), attempting again", err))
+			if s.cache.IsEnabled() {
+				s.cache.GetCache().Purge()
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			if !streamReadySignaled {
+				s.signalStreamReady(ctx.Err())
+			}
+			return
+		case <-time.After(s.retryCounter.sleep()):
+		}
+	}
+
+	// retry attempts exhausted. Disable cache and emit error event
+	s.cache.Disable()
+	connErr := fmt.Errorf("grpc connection establishment failed")
+
+	// Signal error if we haven't signaled success yet
+	if !streamReadySignaled {
+		s.signalStreamReady(connErr)
+	}
+
+	s.sendEvent(ctx, of.Event{
+		ProviderName: "flagd",
+		EventType:    of.ProviderError,
+		ProviderEventDetails: of.ProviderEventDetails{
+			Message: connErr.Error(),
+		},
+	})
+}
+
+// signalStreamReady signals Init() that the event stream status is known
+func (s *Service) signalStreamReady(err error) {
+	select {
+	case s.streamReady <- err:
+		// Signal sent successfully
+	default:
+		// Channel already has a value, don't block
+	}
+}
+
+// streamClient opens the event stream and distribute streams to appropriate handlers.
+func (s *Service) streamClient(ctx context.Context, streamReadySignaled *bool) error {
+	stream, err := s.client.EventStream(ctx, connect.NewRequest(&schemaV2.EventStreamRequest{}))
+	if err != nil {
+		return err
+	}
+
+	s.logger.V(logger.Info).Info("connected to event stream")
+
+	// Signal successful connection to Init() - stream is now ready
+	if !*streamReadySignaled {
+		s.signalStreamReady(nil) // nil means success
+		*streamReadySignaled = true
+	}
+
+	for stream.Receive() {
+		// reset retry counters and proceed to message handling
+		s.retryCounter.reset()
+
+		switch stream.Msg().Type {
+		case string(flagdService.ConfigurationChange):
+			s.handleConfigurationChangeEvent(ctx, stream.Msg())
+		case string(flagdService.ProviderReady):
+			s.handleReadyEvent(ctx)
+		case string(flagdService.Shutdown):
+			// this is considered as a non-error
+			return nil
+		case string(flagdService.KeepAlive):
+		default:
+			// do nothing
+		}
+	}
+
+	if err := stream.Err(); err != nil {
+		s.sendEvent(ctx, of.Event{
+			ProviderName: "flagd",
+			EventType:    of.ProviderError,
+			ProviderEventDetails: of.ProviderEventDetails{
+				Message: fmt.Sprintf("stream error: %s", err.Error()),
+			},
+		})
+		return err
+	}
+
+	return nil
+}
+
+func (s *Service) handleConfigurationChangeEvent(ctx context.Context, event *schemaV2.EventStreamResponse) {
+	if !s.cache.IsEnabled() {
+		return
+	}
+
+	if event.Data == nil {
+		// purge cache and return
+		s.cache.GetCache().Purge()
+		return
+	}
+
+	flagsVal, ok := event.Data.AsMap()["flags"]
+	if !ok {
+		// purge cache and return
+		s.cache.GetCache().Purge()
+		return
+	}
+
+	flags, ok := flagsVal.(map[string]interface{})
+	if !ok {
+		// purge cache and return
+		s.cache.GetCache().Purge()
+		return
+	}
+
+	keys := make([]string, len(flags))
+
+	for flagKey := range flags {
+		s.cache.GetCache().Remove(flagKey)
+		keys = append(keys, flagKey)
+	}
+
+	s.sendEvent(ctx, of.Event{
+		ProviderName: "flagd",
+		EventType:    of.ProviderConfigChange,
+		ProviderEventDetails: of.ProviderEventDetails{
+			Message:     "flags changed",
+			FlagChanges: keys,
+		},
+	})
+}
+
+func (s *Service) handleReadyEvent(ctx context.Context) {
+	s.sendEvent(ctx, of.Event{
+		ProviderName: "flagd",
+		EventType:    of.ProviderReady,
+	})
+}
+
+func (s *Service) sendEvent(ctx context.Context, event of.Event) {
+	select {
+	case <-ctx.Done():
+		return
+	case s.events <- event:
+	}
+}
+
+// derefString safely dereferences a string pointer, returning empty string if nil
+func derefString(s *string) string {
+	if s != nil {
+		return *s
+	}
+	return ""
+}
+
+// newClient is a helper to derive schemaConnectV2.ServiceClient
+func newClient(cfg Configuration) (schemaConnectV2.ServiceClient, error) {
+	var dialContext func(ctx context.Context, network string, addr string) (net.Conn, error)
+	var tlsConfig *tls.Config
+	url := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+	// socket
+	if cfg.SocketPath != "" {
+		dialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
+			return net.Dial("unix", cfg.SocketPath)
+		}
+	}
+	// tls
+	if cfg.TLSEnabled {
+		url = fmt.Sprintf("https://%s:%d", cfg.Host, cfg.Port)
+		tlsConfig = &tls.Config{}
+		if cfg.CertificatePath != "" {
+			caCert, err := os.ReadFile(cfg.CertificatePath)
+			if err != nil {
+				return nil, err
+			}
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, errors.New("error appending provider certificate file. please check and try again")
+			}
+			tlsConfig.RootCAs = caCertPool
+		}
+	}
+
+	// build options
+	var options []connect.ClientOption
+
+	if cfg.OtelInterceptor {
+		interceptor, err := otelconnect.NewInterceptor()
+		if err != nil {
+			return nil, err
+		}
+
+		options = append(options, connect.WithInterceptors(interceptor))
+	}
+
+	if cfg.Selector != "" {
+		options = append(options, connect.WithInterceptors(newSelectorInterceptor(cfg.Selector)))
+	}
+
+	return schemaConnectV2.NewServiceClient(
+		&http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: tlsConfig,
+				DialContext:     dialContext,
+			},
+		},
+		url,
+		options...,
+	), nil
+}

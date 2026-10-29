@@ -1,0 +1,571 @@
+package evaluator
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/diegoholiveira/jsonlogic/v3"
+	schema "github.com/open-feature/flagd-schemas/json"
+	"github.com/open-feature/flagd/core/pkg/logger"
+	"github.com/open-feature/flagd/core/pkg/model"
+	"github.com/open-feature/flagd/core/pkg/store"
+	"github.com/open-feature/flagd/core/pkg/sync"
+	"github.com/santhosh-tekuri/jsonschema/v6"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+	"golang.org/x/exp/maps"
+)
+
+const (
+	SelectorMetadataKey = "scope"
+	flagdPropertiesKey  = "$flagd"
+	// targetingKeyKey is used to extract the targetingKey to bucket on in fractional
+	// evaluation if the user did not supply the optional bucketing property.
+	targetingKeyKey = "targetingKey"
+	Disabled        = "DISABLED"
+	ProtoVersionKey = "__flagd.protoVersion__" // used to mark if the request is coming from an older proto source, which has different fallback behavior
+)
+
+func addSchemaResource(compiler *jsonschema.Compiler, url string, schemaData string) error {
+	unmarshalJSON, err := jsonschema.UnmarshalJSON(strings.NewReader(schemaData))
+	if err != nil {
+		return err
+	}
+	if err := compiler.AddResource(url, unmarshalJSON); err != nil {
+		return err
+	}
+	return nil
+}
+
+type constraints interface {
+	bool | string | map[string]any | float64 | interface{}
+}
+
+type JSONEvaluatorOption func(je *JSON)
+
+type flagdProperties struct {
+	FlagKey   string `json:"flagKey"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+type variantEvaluator func(context.Context, string, string, map[string]any) (
+	variant string, variants map[string]interface{}, reason string, metadata map[string]interface{}, error error)
+
+// Deprecated - this will be remove in the next release
+func WithEvaluator(name string, evalFunc func(interface{}, interface{}) interface{}) JSONEvaluatorOption {
+	return func(_ *JSON) {
+		jsonlogic.AddOperator(name, evalFunc)
+	}
+}
+
+// JSON evaluator
+type JSON struct {
+	store          store.IStore
+	Logger         *logger.Logger
+	jsonEvalTracer trace.Tracer
+	jsonSchema     *jsonschema.Schema
+	Resolver
+}
+
+func NewJSON(logger *logger.Logger, s store.IStore, opts ...JSONEvaluatorOption) *JSON {
+	logger = logger.WithFields(
+		zap.String("component", "evaluator"),
+		zap.String("evaluator", "json"),
+	)
+	tracer := otel.Tracer("jsonEvaluator")
+
+	// Create a new JSON Schema compiler
+	compiler := jsonschema.NewCompiler()
+
+	if err := addSchemaResource(compiler, "https://flagd.dev/schema/v0/flagd.json", schema.FlagdSchema); err != nil {
+		logger.Warn("Failed to add schema resource", zap.Error(err))
+	}
+	if err := addSchemaResource(compiler, "https://flagd.dev/schema/v0/flags.json", schema.FlagSchema); err != nil {
+		logger.Warn("Failed to add schema resource", zap.Error(err))
+	}
+	if err := addSchemaResource(compiler, "https://flagd.dev/schema/v0/targeting.json", schema.TargetingSchema); err != nil {
+		logger.Warn("Failed to add schema resource", zap.Error(err))
+	}
+
+	jsonSchema, err := compiler.Compile("https://flagd.dev/schema/v0/flagd.json")
+	if err != nil {
+		logger.Fatal("Failed to compile schema", zap.Error(err))
+	}
+	ev := JSON{
+		store:          s,
+		Logger:         logger,
+		jsonEvalTracer: tracer,
+		jsonSchema:     jsonSchema,
+		Resolver:       NewResolver(s, logger, tracer),
+	}
+
+	for _, o := range opts {
+		o(&ev)
+	}
+
+	return &ev
+}
+
+func (je *JSON) SetState(payload sync.DataSync) error {
+	_, span := je.jsonEvalTracer.Start(
+		context.Background(),
+		"flagSync",
+		trace.WithAttributes(attribute.String("feature_flag.source", payload.Source)))
+	defer span.End()
+
+	var definition Definition
+
+	err := je.configToFlagDefinition(payload.FlagData, &definition)
+	if err != nil {
+		span.SetStatus(codes.Error, "flagSync error")
+		span.RecordError(err)
+		return err
+	}
+
+	je.store.Update(payload.Source, definition.Flags, definition.Metadata, payload.IncrementalUpdates)
+
+	return nil
+}
+
+// Resolver implementation for flagd flags. This resolver should be kept reusable, hence must interact with interfaces.
+type Resolver struct {
+	store  store.IStore
+	Logger *logger.Logger
+	tracer trace.Tracer
+}
+
+func NewResolver(store store.IStore, logger *logger.Logger, jsonEvalTracer trace.Tracer) Resolver {
+	// register supported json logic custom operator implementations
+	jsonlogic.AddOperator(FractionEvaluationName, NewFractional(logger).Evaluate)
+	jsonlogic.AddOperator(StartsWithEvaluationName, NewStringComparisonEvaluator(logger).StartsWithEvaluation)
+	jsonlogic.AddOperator(EndsWithEvaluationName, NewStringComparisonEvaluator(logger).EndsWithEvaluation)
+	jsonlogic.AddOperator(SemVerEvaluationName, NewSemVerComparison(logger).SemVerEvaluation)
+
+	return Resolver{store: store, Logger: logger, tracer: jsonEvalTracer}
+}
+
+func (je *Resolver) ResolveAllValues(ctx context.Context, reqID string, context map[string]any) ([]AnyValue,
+	model.Metadata, error,
+) {
+	_, span := je.tracer.Start(ctx, "resolveAll")
+	defer span.End()
+
+	var selector store.Selector
+	s := ctx.Value(store.SelectorContextKey{})
+	if s != nil {
+		selector = s.(store.Selector)
+	}
+	allFlags, flagSetMetadata, err := je.store.GetAll(ctx, &selector)
+	if err != nil {
+		return nil, flagSetMetadata, fmt.Errorf("error retreiving flags from the store: %w", err)
+	}
+
+	values := []AnyValue{}
+	var value interface{}
+	var variant string
+	var reason string
+	var metadata map[string]interface{}
+
+	for _, flag := range allFlags {
+		defaultValue := flag.Variants[flag.DefaultVariant]
+		switch defaultValue.(type) {
+		case bool:
+			value, variant, reason, metadata, err = resolve[bool](ctx, reqID, flag.Key, context, je.evaluateVariant)
+		case string:
+			value, variant, reason, metadata, err = resolve[string](ctx, reqID, flag.Key, context, je.evaluateVariant)
+		case float64:
+			value, variant, reason, metadata, err = resolve[float64](ctx, reqID, flag.Key, context, je.evaluateVariant)
+		case map[string]any:
+			value, variant, reason, metadata, err = resolve[map[string]any](ctx, reqID, flag.Key, context, je.evaluateVariant)
+		default:
+			if ctx.Value(ProtoVersionKey) == nil {
+				value, variant, reason, metadata, err = resolve[interface{}](ctx, reqID, flag.Key, context, je.evaluateVariant)
+			} else {
+				// old proto version behavior
+				continue
+			}
+		}
+		if err != nil {
+			je.Logger.ErrorWithID(reqID, fmt.Sprintf("bulk evaluation: key: %s returned error: %s", flag.Key, err.Error()))
+		}
+		values = append(values, NewAnyValue(value, variant, reason, flag.Key, metadata, err))
+	}
+
+	return values, flagSetMetadata, nil
+}
+
+func (je *Resolver) ResolveBooleanValue(
+	ctx context.Context, reqID string, flagKey string, context map[string]any) (
+	value bool,
+	variant string,
+	reason string,
+	metadata map[string]interface{},
+	err error,
+) {
+	_, span := je.tracer.Start(ctx, "resolveBoolean")
+	defer span.End()
+
+	je.Logger.DebugWithID(reqID, fmt.Sprintf("evaluating boolean flag: %s", flagKey))
+	return resolve[bool](ctx, reqID, flagKey, context, je.evaluateVariant)
+}
+
+func (je *Resolver) ResolveStringValue(
+	ctx context.Context, reqID string, flagKey string, context map[string]any) (
+	value string,
+	variant string,
+	reason string,
+	metadata map[string]interface{},
+	err error,
+) {
+	_, span := je.tracer.Start(ctx, "resolveString")
+	defer span.End()
+
+	je.Logger.DebugWithID(reqID, fmt.Sprintf("evaluating string flag: %s", flagKey))
+	return resolve[string](ctx, reqID, flagKey, context, je.evaluateVariant)
+}
+
+func (je *Resolver) ResolveFloatValue(
+	ctx context.Context, reqID string, flagKey string, context map[string]any) (
+	value float64,
+	variant string,
+	reason string,
+	metadata map[string]interface{},
+	err error,
+) {
+	_, span := je.tracer.Start(ctx, "resolveFloat")
+	defer span.End()
+
+	je.Logger.DebugWithID(reqID, fmt.Sprintf("evaluating float flag: %s", flagKey))
+	value, variant, reason, metadata, err = resolve[float64](ctx, reqID, flagKey, context, je.evaluateVariant)
+	return
+}
+
+func (je *Resolver) ResolveIntValue(ctx context.Context, reqID string, flagKey string, context map[string]any) (
+	value int64,
+	variant string,
+	reason string,
+	metadata map[string]interface{},
+	err error,
+) {
+	_, span := je.tracer.Start(ctx, "resolveInt")
+	defer span.End()
+
+	je.Logger.DebugWithID(reqID, fmt.Sprintf("evaluating int flag: %s", flagKey))
+	var val float64
+	val, variant, reason, metadata, err = resolve[float64](ctx, reqID, flagKey, context, je.evaluateVariant)
+	value = int64(val)
+	return
+}
+
+func (je *Resolver) ResolveObjectValue(
+	ctx context.Context, reqID string, flagKey string, context map[string]any) (
+	value map[string]any,
+	variant string,
+	reason string,
+	metadata map[string]interface{},
+	err error,
+) {
+	_, span := je.tracer.Start(ctx, "resolveObject")
+	defer span.End()
+
+	je.Logger.DebugWithID(reqID, fmt.Sprintf("evaluating object flag: %s", flagKey))
+	return resolve[map[string]any](ctx, reqID, flagKey, context, je.evaluateVariant)
+}
+
+func (je *Resolver) ResolveAsAnyValue(
+	ctx context.Context,
+	reqID string,
+	flagKey string,
+	context map[string]any,
+) AnyValue {
+	_, span := je.tracer.Start(ctx, "resolveAnyValue")
+	defer span.End()
+
+	je.Logger.DebugWithID(reqID, fmt.Sprintf("evaluating flag `%s` as a generic flag", flagKey))
+	value, variant, reason, meta, err := resolve[interface{}](ctx, reqID, flagKey, context, je.evaluateVariant)
+	return NewAnyValue(value, variant, reason, flagKey, meta, err)
+}
+
+// resolve is a helper for generic flag resolving
+func resolve[T constraints](ctx context.Context, reqID string, key string, context map[string]any,
+	variantEval variantEvaluator) (value T, variant string, reason string, metadata map[string]interface{}, err error,
+) {
+	variant, variants, reason, metadata, err := variantEval(ctx, reqID, key, context)
+	if err != nil {
+		return value, variant, reason, metadata, err
+	}
+
+	if reason == model.FallbackReason {
+		var zero T
+		return zero, variant, model.FallbackReason, metadata, nil
+	}
+
+	if reason == model.DisabledReason {
+		var zero T
+		return zero, "", model.DisabledReason, metadata, nil
+	}
+
+	var ok bool
+	value, ok = variants[variant].(T)
+	if !ok {
+		return value, variant, model.ErrorReason, metadata, errors.New(model.TypeMismatchErrorCode)
+	}
+
+	return value, variant, reason, metadata, nil
+}
+
+// nolint: funlen
+func (je *Resolver) evaluateVariant(ctx context.Context, reqID string, flagKey string, evalCtx map[string]any) (
+	variant string, variants map[string]interface{}, reason string, metadata map[string]interface{}, err error,
+) {
+
+	var selector store.Selector
+	s := ctx.Value(store.SelectorContextKey{})
+	if s != nil {
+		selector = s.(store.Selector)
+	}
+	flag, metadata, err := je.store.Get(ctx, flagKey, &selector)
+	if err != nil {
+		// flag not found
+		je.Logger.DebugWithID(reqID, fmt.Sprintf("requested flag could not be found: %s", flagKey))
+		return "", map[string]interface{}{}, model.ErrorReason, metadata, errors.New(model.FlagNotFoundErrorCode)
+	}
+
+	for key, value := range flag.Metadata {
+		// If value is not nil or empty, copy to metadata
+		if value != nil {
+			metadata[key] = value
+		}
+	}
+
+	if flag.State == Disabled {
+		je.Logger.DebugWithID(reqID, fmt.Sprintf("requested flag is disabled: %s", flagKey))
+		return "", nil, model.DisabledReason, metadata, nil
+	}
+
+	// get the targeting logic, if any
+	targeting := flag.Targeting
+
+	if targeting != nil && string(targeting) != "{}" {
+		targetingBytes, err := targeting.MarshalJSON()
+		if err != nil {
+			je.Logger.ErrorWithID(reqID, fmt.Sprintf("Error parsing rules for flag: %s, %s", flagKey, err))
+			return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.ParseErrorCode)
+		}
+
+		evalCtx = setFlagdProperties(je.Logger, evalCtx, flagdProperties{
+			FlagKey:   flagKey,
+			Timestamp: time.Now().Unix(),
+		})
+
+		b, err := json.Marshal(evalCtx)
+		if err != nil {
+			je.Logger.ErrorWithID(reqID, fmt.Sprintf("error parsing context for flag: %s, %s, %v", flagKey, err, evalCtx))
+
+			return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.ErrorReason)
+		}
+
+		var result bytes.Buffer
+		// evaluate JsonLogic rules to determine the variant
+		err = jsonlogic.Apply(bytes.NewReader(targetingBytes), bytes.NewReader(b), &result)
+		if err != nil {
+			je.Logger.ErrorWithID(reqID, fmt.Sprintf("error applying targeting rules: %s", err))
+			return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.ParseErrorCode)
+		}
+
+		// check if string is "null" before we strip quotes, so we can differentiate between JSON null and "null"
+		trimmed := strings.TrimSpace(result.String())
+
+		if trimmed == "null" {
+			if flag.DefaultVariant == "" {
+				if ctx.Value(ProtoVersionKey) != nil {
+					// old proto version behavior
+					return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.FlagNotFoundErrorCode)
+				}
+
+				return "", flag.Variants, model.FallbackReason, metadata, nil
+			}
+
+			return flag.DefaultVariant, flag.Variants, model.DefaultReason, metadata, nil
+		}
+
+		// strip whitespace and quotes from the variant
+		variant = strings.ReplaceAll(trimmed, "\"", "")
+
+		// if this is a valid variant, return it
+		if _, ok := flag.Variants[variant]; ok {
+			return variant, flag.Variants, model.TargetingMatchReason, metadata, nil
+		}
+		je.Logger.ErrorWithID(reqID,
+			fmt.Sprintf("invalid or missing variant: %s for flagKey: %s, variant is not valid", variant, flagKey))
+		return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.GeneralErrorCode)
+	}
+
+	if flag.DefaultVariant == "" {
+		if ctx.Value(ProtoVersionKey) != nil {
+			// old proto version behavior
+			return "", flag.Variants, model.ErrorReason, metadata, errors.New(model.FlagNotFoundErrorCode)
+		}
+		return "", flag.Variants, model.FallbackReason, metadata, nil
+	}
+
+	return flag.DefaultVariant, flag.Variants, model.StaticReason, metadata, nil
+}
+
+func setFlagdProperties(
+	log *logger.Logger,
+	context map[string]any,
+	properties flagdProperties,
+) map[string]any {
+	if context == nil {
+		context = map[string]any{}
+	}
+
+	newContext := maps.Clone(context)
+
+	if _, ok := newContext[flagdPropertiesKey]; ok {
+		log.Warn("overwriting $flagd properties in the context")
+	}
+
+	newContext[flagdPropertiesKey] = properties
+
+	return newContext
+}
+
+func getFlagdProperties(context map[string]any) (flagdProperties, bool) {
+	properties, ok := context[flagdPropertiesKey]
+	if !ok {
+		return flagdProperties{}, false
+	}
+
+	b, err := json.Marshal(properties)
+	if err != nil {
+		return flagdProperties{}, false
+	}
+
+	var p flagdProperties
+	if err := json.Unmarshal(b, &p); err != nil {
+		return flagdProperties{}, false
+	}
+
+	return p, true
+}
+
+// configToFlagDefinition convert string configurations to flags and store them to pointer newFlags
+func (je *JSON) configToFlagDefinition(config string, definition *Definition) error {
+	// json schema validation
+	inst, err := jsonschema.UnmarshalJSON(strings.NewReader(config))
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal JSON string: %v", err)
+	}
+	if err := je.jsonSchema.Validate(inst); err != nil {
+		je.Logger.Warn(fmt.Sprintf(
+			"flag definition does not conform to the schema; validation errors: %s", err),
+		)
+	}
+
+	type JsonRawDef struct {
+		Flags    json.RawMessage        `json:"flags"`
+		Metadata map[string]interface{} `json:"metadata"`
+	}
+
+	// Transpose evaluators and unmarshal directly into JsonDef
+	transposedConfig, err := transposeEvaluators(config)
+	if err != nil {
+		return fmt.Errorf("transposing evaluators: %w", err)
+	}
+
+	var rawDef JsonRawDef
+	err = json.Unmarshal([]byte(transposedConfig), &rawDef)
+	if err != nil {
+		return fmt.Errorf("unmarshalling provided configurations: %w", err)
+	}
+	definition.Metadata = rawDef.Metadata
+	definition.Flags = []model.Flag{}
+
+	// Check if flags is an array or object
+	trimmed := strings.TrimSpace(string(rawDef.Flags))
+	if strings.HasPrefix(trimmed, "[") {
+		// It's an array
+		var flags []model.Flag
+		if err := json.Unmarshal(rawDef.Flags, &flags); err != nil {
+			return fmt.Errorf("unmarshalling flags array: %w", err)
+		}
+		definition.Flags = flags
+	} else {
+		// It's an object
+		var flagsMap map[string]model.Flag
+		if err := json.Unmarshal(rawDef.Flags, &flagsMap); err != nil {
+			return fmt.Errorf("unmarshalling flags map: %w", err)
+		}
+		// convert map to slice
+		var flags []model.Flag
+		for k, v := range flagsMap {
+			v.Key = k
+			flags = append(flags, v)
+		}
+		definition.Flags = flags
+	}
+	return validateDefaultVariants(definition)
+}
+
+// validateDefaultVariants returns an error if any of the default variants aren't valid
+func validateDefaultVariants(flags *Definition) error {
+	for _, flag := range flags.Flags {
+		// Default Variant is not provided in the config
+		if flag.DefaultVariant == "" {
+			continue
+		}
+
+		if _, ok := flag.Variants[flag.DefaultVariant]; !ok {
+			return fmt.Errorf(
+				"default variant: '%s' isn't a valid variant of flag: '%s'", flag.DefaultVariant, flag.Key,
+			)
+		}
+	}
+
+	return nil
+}
+
+func transposeEvaluators(state string) (string, error) {
+	var evaluators Evaluators
+	if err := json.Unmarshal([]byte(state), &evaluators); err != nil {
+		return "", fmt.Errorf("unmarshal: %w", err)
+	}
+
+	// round-trip to normalize whitespace so we can use plain string matching
+	var raw interface{}
+	if err := json.Unmarshal([]byte(state), &raw); err != nil {
+		return "", fmt.Errorf("normalize: %w", err)
+	}
+	normalizedBytes, err := json.Marshal(raw)
+	if err != nil {
+		return "", fmt.Errorf("normalize marshal: %w", err)
+	}
+	result := string(normalizedBytes)
+
+	for evalName, evalRaw := range evaluators.Evaluators {
+		marshalledEval, err := evalRaw.MarshalJSON()
+		if err != nil {
+			return "", fmt.Errorf("marshal evaluator: %w", err)
+		}
+
+		evalValue := string(marshalledEval)
+		if len(evalValue) < 3 {
+			return "", errors.New("evaluator object is empty")
+		}
+
+		refPattern := `{"$ref":"` + evalName + `"}`
+		result = strings.ReplaceAll(result, refPattern, evalValue)
+	}
+
+	return result, nil
+}

@@ -30,6 +30,26 @@ The following environment variables are supported:
 - **QUICKPIZZA_FAIL_RATE_RECOMMENDATIONS_API_PIZZA_POST**: Set to a number to fail `<number>%` of pizza POST requests randomly.
 - **QUICKPIZZA_FAIL_RATE_CATALOG_DATABASE_RECORD_RECOMMENDATION**: Set to a number to make `<number>%` of `RecordRecommendation` database calls fail with a genuine PostgreSQL error (`column "nonexistent_column" does not exist`). Requires a PostgreSQL backend (`QUICKPIZZA_DB`).
 
+- **QUICKPIZZA_CPU_BURN_RECOMMENDATIONS**: Keeps the CPU busy for the given duration (a Go duration string) on every recommendations request, to simulate CPU saturation.
+
+### Switching faults at runtime with flagd
+
+Environment variables are read when the pod starts, so changing one restarts the service. To switch faults at runtime instead, set `QUICKPIZZA_FLAGD_HOST` (and `FLAGD_PORT` if flagd does not listen on 8013). Every variable above is then first evaluated as a [flagd](https://flagd.dev) string flag of the same name, on every request:
+
+```json
+{
+  "flags": {
+    "QUICKPIZZA_FAIL_RATE_RECOMMENDATIONS_API_PIZZA_POST": {
+      "state": "ENABLED",
+      "variants": { "on": "30", "off": "" },
+      "defaultVariant": "on"
+    }
+  }
+}
+```
+
+A served value of `""` turns the fault off. If flagd is unreachable or does not define the flag, the environment variable is used.
+
 ## Using HTTP Headers
 
 You can introduce errors from the client side using custom headers. Below is a list of the currently supported error headers:
