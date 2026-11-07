@@ -1316,10 +1316,11 @@ func (s *Server) AddRecommendations(catalogClient CatalogClient, copyClient Copy
 		r.Use(LogUser)
 		r.Use(errorinjector.InjectErrorHeadersMiddleware)
 
-		// if env var is set, apply delay to all endpoints of this service
+		// if env var is set, apply delay and CPU burn to all endpoints of this service
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				util.DelayIfEnvSet("QUICKPIZZA_DELAY_RECOMMENDATIONS")
+				util.BurnCPUIfEnvSet("QUICKPIZZA_CPU_BURN_RECOMMENDATIONS")
 				next.ServeHTTP(w, r)
 			})
 		})

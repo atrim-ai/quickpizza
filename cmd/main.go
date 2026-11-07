@@ -17,6 +17,7 @@ import (
 	qpgrpc "github.com/grafana/quickpizza/pkg/grpc"
 	qphttp "github.com/grafana/quickpizza/pkg/http"
 	"github.com/grafana/quickpizza/pkg/logging"
+	"github.com/grafana/quickpizza/pkg/util"
 	"github.com/hashicorp/go-retryablehttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/propagation"
@@ -65,6 +66,9 @@ func main() {
 			otelInstaller.Insecure()
 		}
 	}
+
+	// Read fault settings from flagd if configured, falling back to environment variables.
+	util.InitFaultFlags()
 
 	// Create the QuickPizza server.
 	server := qphttp.NewServer(profilingEnabled, otelInstaller)
