@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	flagd "github.com/open-feature/go-sdk-contrib/providers/flagd/pkg"
@@ -56,15 +57,74 @@ func InitFaultFlags() {
 
 // faultSetting returns the value of the fault named by envVarName and whether it is set. A flagd string flag of
 // the same name takes precedence, with "" meaning off; if flagd is not configured or the flag cannot be
-// evaluated, the environment variable is used.
+// evaluated, the environment variable is used. A failed evaluation is logged (see faultReadLog) before the
+// fallback, so a flagd that is down, out of memory or missing the evaluation RPC does not silently read as the
+// env var (usually: off) while flagd itself shows the fault on.
 func faultSetting(envVarName string) (string, bool) {
 	if faultFlags != nil {
-		value, err := faultFlags.StringValue(context.Background(), envVarName, "", openfeature.EvaluationContext{})
+		details, err := faultFlags.StringValueDetails(context.Background(), envVarName, "", openfeature.EvaluationContext{})
 		if err == nil {
-			return value, value != ""
+			return details.Value, details.Value != ""
 		}
+		value, ok := os.LookupEnv(envVarName)
+		faultReadLog.failed(envVarName, details.ErrorCode, err, ok)
+		return value, ok
 	}
 	return os.LookupEnv(envVarName)
+}
+
+// faultReadLogInterval is the minimum time between two log lines for failed reads of the same flag.
+const faultReadLogInterval = time.Minute
+
+// faultReadLog logs failed fault reads, at most once per flag per faultReadLogInterval.
+var faultReadLog = newFaultReadLimiter(faultReadLogInterval, time.Now)
+
+// faultReadLimiter rate-limits the failed-read log per flag key. Faults are read on every request, so an unlimited
+// line would flood the log for as long as flagd is unreachable. Each line carries the number of failures
+// suppressed since the previous line for that flag.
+type faultReadLimiter struct {
+	interval time.Duration
+	now      func() time.Time
+
+	mu         sync.Mutex
+	last       map[string]time.Time
+	suppressed map[string]int
+}
+
+func newFaultReadLimiter(interval time.Duration, now func() time.Time) *faultReadLimiter {
+	return &faultReadLimiter{interval: interval, now: now, last: map[string]time.Time{}, suppressed: map[string]int{}}
+}
+
+// allow reports whether a failed read of key may be logged now and, if so, how many were suppressed before it.
+func (l *faultReadLimiter) allow(key string) (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if last, seen := l.last[key]; seen && now.Sub(last) < l.interval {
+		l.suppressed[key]++
+		return false, 0
+	}
+	n := l.suppressed[key]
+	l.last[key] = now
+	l.suppressed[key] = 0
+	return true, n
+}
+
+// failed logs a failed evaluation of the fault flag key. FLAG_NOT_FOUND is the documented "flagd does not define
+// this fault, use the env var" path and logs at debug; every other code (flagd unreachable, provider not ready,
+// a missing RPC) logs a warning.
+func (l *faultReadLimiter) failed(key string, code openfeature.ErrorCode, err error, envSet bool) {
+	ok, suppressed := l.allow(key)
+	if !ok {
+		return
+	}
+	level := slog.LevelWarn
+	if code == openfeature.FlagNotFoundCode {
+		level = slog.LevelDebug
+	}
+	slog.Log(context.Background(), level, "fault flag read failed, falling back to the env var",
+		"flag", key, "error_code", string(code), "err", err, "env_set", envSet,
+		"suppressed", suppressed, "log_interval", l.interval.String())
 }
 
 // DelayIfEnvSet sleeps for the duration specified by the environment variable (or the flagd flag of the same name).

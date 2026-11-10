@@ -50,6 +50,8 @@ Environment variables are read when the pod starts, so changing one restarts the
 
 A served value of `""` turns the fault off. If flagd is unreachable or does not define the flag, the environment variable is used.
 
+A failed read is logged before that fallback, at most once per flag per minute, with the flag key, the OpenFeature error code and the number of failures suppressed since the previous line (`"msg":"fault flag read failed, falling back to the env var"`). It logs at `WARN`, except `FLAG_NOT_FOUND` (flagd does not define the flag), which logs at `DEBUG`. So a flagd that is down, out of memory or lacks the evaluation v2 RPC no longer reads silently as the environment variable while flagd shows the fault on.
+
 ## Using HTTP Headers
 
 You can introduce errors from the client side using custom headers. Below is a list of the currently supported error headers:
